@@ -1,0 +1,26 @@
+# --- СЕКРЕТЫ: никогда не коммитить ---
+.env
+embedded_config.py
+
+# бэкапы с вшитым ключом
+*.bak-*
+*.bak
+embedded_config.py.bak-*
+swarm_lab.py.bak-*
+
+# собранный exe содержит ключ, запечённый build_exe.py
+*.exe
+SwarmLab.exe
+dist/
+build/
+*.spec
+
+# --- вывод экспериментов (листинг рабочего стола, приватность) ---
+room/
+swarm_logs/
+room/_archive/
+room/_scratch/
+
+# --- мусор ---
+__pycache__/
+*.pyc
