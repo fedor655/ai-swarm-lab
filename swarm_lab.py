@@ -91,11 +91,28 @@ WEB_MAX_CHARS = 2500
 ERROR_BACKOFF = 90             # пауза при ошибке API
 STATE_LOCK = threading.Lock()  # сериализует изменения комнаты (доска, файлы)
 AGENTS_LOCK = threading.Lock() # сериализует доступ к списку агентов
+# Жёсткий потолок API по замерам: ~4 одновременных запроса, ~6 запросов/мин.
+API_SEM = threading.Semaphore(int(os.environ.get("API_PARALLEL", "4")))
 
 AGENTS = [f"Агент-{i}" for i in range(1, AGENT_COUNT + 1)]
 
 CARRY = {}                # результат READ/SEARCH/WEB/HOST_* -> следующий ход агента
 CARRY_LOCK = threading.Lock()
+CARRY_FILE = DATA_DIR / "_carry.json"  # переживает перезапуск процесса
+
+def carry_load():
+    global CARRY
+    try:
+        if CARRY_FILE.exists():
+            CARRY = json.loads(CARRY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        CARRY = {}
+
+def carry_save():
+    try:
+        CARRY_FILE.write_text(json.dumps(CARRY, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
 MOCK = False              # включается флагом --mock
 NO_POPUP = os.environ.get("SWARM_NO_POPUP") == "1"  # для тестов: без окон
@@ -229,12 +246,13 @@ def llm(name, user_msg):
         "temperature": 1.0,
     }
     t0 = time.time()
-    r = SESSION.post(
-        f"{BASE_URL}/chat/completions",
-        headers={"Authorization": f"Bearer {API_KEY}"},
-        json=payload,
-        timeout=180,
-    )
+    with API_SEM:  # не больше N одновременных запросов к API
+        r = SESSION.post(
+            f"{BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json=payload,
+            timeout=180,
+        )
     dt = time.time() - t0
     if r.status_code != 200:
         raise RuntimeError(f"API {r.status_code}: {r.text[:300]}")
@@ -499,6 +517,8 @@ def agent_loop(agent):
             state = room_state(agent)
             with CARRY_LOCK:
                 extra = CARRY.pop(agent, None)
+                if extra is not None:
+                    carry_save()
             if extra:
                 state += f"\n=== РЕЗУЛЬТАТ ТВОИХ ПРОШЛЫХ ЗАПРОСОВ ===\n{extra}\n"
             # ЧЁРНЫЙ ЯЩИК: логируем всё, что ушло модели
@@ -522,10 +542,17 @@ def agent_loop(agent):
             if result:
                 with CARRY_LOCK:
                     CARRY[agent] = result
+                    carry_save()
+        except RuntimeError as e:
+            # 429 — rate limit: отдыхаем недолго и пробуем снова,
+            # остальные API-ошибки — стандартный backoff
+            wait = random.uniform(20, 40) if "429" in str(e) else ERROR_BACKOFF
+            log(agent, "ERROR", f"{e} -> повтор через {wait:.0f}с")
+            time.sleep(wait)
         except Exception as e:
-            log(agent, "ERROR", f"{type(e).__name__}: {e}")
+            log(agent, "ERROR", f"{type(e).__name__}: {e} -> повтор через {ERROR_BACKOFF}с")
             time.sleep(ERROR_BACKOFF)
-        time.sleep(random.uniform(1, 5))  # личный темп агента
+        time.sleep(random.uniform(8, 20))  # личный темп: суммарно ~6-10 запросов/мин на весь рой
 
 def start_dashboard():
     try:
@@ -556,6 +583,7 @@ def main():
     except Exception:
         pass
     SECRET_TEXT = ensure_secret()
+    carry_load()  # подтягиваем незакрытые результаты прошлой сессии
     if not BOARD_FILE.exists():
         BOARD_FILE.write_text(
             "# Общая доска\n\n"
