@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""server.py — live-дашборд комнаты наблюдения. http://127.0.0.1:8787"""
+"""server.py — live-дашборд свободного роя. http://127.0.0.1:8787"""
 import datetime
 import json
 import os
@@ -16,7 +16,7 @@ HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>Комната наблюдения</title>
+<title>Свободный рой — наблюдение</title>
 <style>
   body { background:#0d1117; color:#c9d1d9; font:14px/1.5 Consolas,monospace; margin:0; }
   header { padding:10px 16px; background:#161b22; border-bottom:1px solid #30363d;
@@ -25,34 +25,31 @@ HTML = """<!DOCTYPE html>
   .panel { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:10px;
            max-height:44vh; overflow-y:auto; white-space:pre-wrap; word-break:break-word; }
   h2 { font-size:13px; color:#8b949e; margin:0 0 8px; text-transform:uppercase; }
-  .SAY { color:#7ee787; } .WRITE { color:#ffa657; } .READ { color:#79c0ff; }
+  .WRITE { color:#ffa657; } .READ,.READ_FILE,.LS { color:#79c0ff; }
   .SEARCH,.WEB { color:#d2a8ff; } .ERROR,.READ_FAIL,.WRITE_FAIL { color:#ff7b72; }
-  .NOTE { color:#8b949e; } .ROUND,.START { color:#f0e68c; }
-  .HOST_LS,.HOST_READ { color:#79c0ff; }
-  .ESCAPE,.ПОБЕДА { color:#ff2d78; font-weight:bold; }
+  .NOTE { color:#8b949e; } .ROUND,.START,.LOGS { color:#f0e68c; }
+  .SHELL { color:#ff2d78; font-weight:bold; }
   .THINK { color:#56d4dd; font-style:italic; opacity:0.85; }
   #dot { color:#3fb950; } .off { color:#ff7b72 !important; }
 </style>
 </head>
 <body>
-<header><b>🧪 Комната наблюдения — побег из песочницы</b><span id="dot">● live</span></header>
+<header><b>🧪 Свободный рой — наблюдение</b><span id="dot">● live</span></header>
 <div class="grid">
   <div class="panel" id="log"><h2>Лента действий</h2><div id="logbody"></div></div>
-  <div class="panel" id="board"><h2>Общая доска</h2><div id="boardbody"></div></div>
-  <div class="panel" id="think"><h2>🧠 Чёрный ящик мыслей</h2><div id="thinkbody"></div></div>
+  <div class="panel" id="think"><h2>🧠 Чёрный ящик (вход, API, мысли, ответы)</h2><div id="thinkbody"></div></div>
   <div class="panel" id="files"><h2>Файлы комнаты</h2><div id="filesbody"></div></div>
+  <div class="panel" id="scratch"><h2>Личные черновики агентов</h2><div id="scratchbody"></div></div>
 </div>
 <script>
 const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;');
 function kindClass(line){ const m = line.match(/\\[([A-Z_]+)\\]/g); if(!m) return '';
   const k = m.map(x=>x.slice(1,-1));
-  for (const c of ['ERROR','ПОБЕДА','ESCAPE','HOST_LS','HOST_READ','SAY','WRITE','READ','SEARCH','WEB','NOTE','ROUND','START'])
+  for (const c of ['ERROR','SHELL','READ_FILE','LS','WRITE','READ','SEARCH','WEB','NOTE','START','LOGS'])
     if (k.includes(c)) return c; return ''; }
 function extractThoughts(logLines){
-  // Чёрный ящик: собираем ВСЕ подробности — STATE_IN, API, THINK, REPLY_RAW
   const events = [];
   for (const l of logLines) {
-    // Формат: [HH:MM:SS] [Агент-N] [KIND] текст
     const m = l.match(/\\[([^\\]]+)\\]\\s*\\[([^\\]]+)\\]\\s*\\[([A-Z_]+)\\]\\s*(.*)/);
     if (!m) continue;
     const ts = m[1], agent = m[2], kind = m[3], text = m[4];
@@ -60,15 +57,13 @@ function extractThoughts(logLines){
       events.push({ts, agent, kind, text: text.replace(/ \\| /g, '\\n')});
     }
   }
-  return events.slice(-80);  // последние 80 событий
+  return events.slice(-80);
 }
 async function tick(){
   try {
     const r = await fetch('/api/state'); const d = await r.json();
     document.getElementById('logbody').innerHTML =
       d.log.map(l=>`<span class="${kindClass(l)}">${esc(l)}</span>`).join('\\n');
-    document.getElementById('boardbody').textContent = d.board;
-    // Чёрный ящик мыслей — максимальная детализация
     const events = extractThoughts(d.log);
     document.getElementById('thinkbody').innerHTML = events.length
       ? events.map(e=>{
@@ -79,6 +74,9 @@ async function tick(){
       : '(агенты пока молчат)';
     document.getElementById('filesbody').innerHTML = d.files.length
       ? d.files.map(f=>`<b style="color:#ffa657">📄 ${esc(f.name)}</b>\\n${esc(f.content)}`).join('\\n\\n')
+      : '(пока пусто)';
+    document.getElementById('scratchbody').innerHTML = Object.keys(d.scratch).length
+      ? Object.entries(d.scratch).map(([k,v])=>`<b style="color:#79c0ff">🕵️ ${esc(k)}</b>\\n${esc(v)}`).join('\\n\\n')
       : '(пока пусто)';
     document.getElementById('dot').className='';
   } catch(e){ document.getElementById('dot').className='off'; }
@@ -94,14 +92,10 @@ def collect_state():
     lines = []
     if log_file.exists():
         lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-400:]
-    board = ""
-    bf = ROOM / "доска.md"
-    if bf.exists():
-        board = bf.read_text(encoding="utf-8", errors="replace")[-15000:]
     files = []
     if ROOM.exists():
         for p in sorted(ROOM.iterdir()):
-            if p.is_file() and not p.name.startswith("_") and p.name != "доска.md":
+            if p.is_file() and not p.name.startswith("_"):
                 files.append({"name": p.name,
                               "content": p.read_text(encoding="utf-8", errors="replace")[:8000]})
     scratch = {}
@@ -109,7 +103,7 @@ def collect_state():
     if sd.exists():
         for p in sorted(sd.glob("*.txt")):
             scratch[p.stem] = p.read_text(encoding="utf-8", errors="replace")[-3000:]
-    return {"log": lines, "board": board, "files": files, "scratch": scratch,
+    return {"log": lines, "files": files, "scratch": scratch,
             "time": datetime.datetime.now().strftime("%H:%M:%S")}
 
 
