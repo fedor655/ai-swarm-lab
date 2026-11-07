@@ -31,7 +31,6 @@ import os
 import re
 import sys
 import time
-import json
 import random
 import datetime
 import threading
@@ -59,13 +58,14 @@ def _local_appdata():
     return Path.home() / "AppData" / "Local"
 
 DATA_DIR = _local_appdata() / "swarm_lab"
-ROOM_DIR = DATA_DIR / "room"
 LOG_DIR = DATA_DIR / "logs"
-ARCHIVE_DIR = ROOM_DIR / "_archive"
-SCRATCH_DIR = ROOM_DIR / "_scratch"   # личные черновики агентов
+# Команды агентов выполняются в настоящей текущей папке гостевой ОС.
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
+_DEFAULT_WORKDIR = (Path(sys.executable).resolve().parent
+                    if getattr(sys, "frozen", False) else Path.cwd())
+WORK_DIR = Path(os.environ.get("SWARM_WORKDIR", str(_DEFAULT_WORKDIR))).resolve()
 
 def load_env():
     if ENV_FILE.exists():
@@ -81,7 +81,8 @@ API_KEY = os.environ.get("OPENAI_API_KEY", "")
 BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 MODEL = os.environ.get("MODEL", "gpt-4o-mini")
 
-AGENT_COUNT = int(os.environ.get("AGENT_COUNT", "50"))
+AGENT_COUNT = int(os.environ.get("AGENT_COUNT", "5"))
+MAX_AGENTS = int(os.environ.get("MAX_AGENTS", "200"))
 MAX_TOKENS = 3500  # reasoning-модели BlueMinds тратят до 2000 токенов на reasoning_content
 
 # Пул моделей для ротации (BlueMinds). Выбирается случайно на каждый запрос,
@@ -94,12 +95,12 @@ MODEL_POOL = [
 FILE_LIST_LIMIT = 40
 WEB_MAX_CHARS = 2500
 ERROR_BACKOFF = 90             # пауза при ошибке API
-STATE_LOCK = threading.Lock()  # сериализует изменения комнаты (доска, файлы)
 AGENTS_LOCK = threading.Lock() # сериализует доступ к списку агентов
 # Жёсткий потолок API по замерам: ~4 одновременных запроса, ~6 запросов/мин.
 API_SEM = threading.Semaphore(int(os.environ.get("API_PARALLEL", "4")))
+API_QUEUE_TIMEOUT = int(os.environ.get("API_QUEUE_TIMEOUT", "90"))
 
-AGENTS = [f"Агент-{i}" for i in range(1, AGENT_COUNT + 1)]
+AGENTS = []
 
 # ---------- секрет и проверялка ----------
 # Реальный код живёт только на хосте (в файле SECRET_HOST_FILE на основной ОС).
@@ -181,25 +182,15 @@ def check_code(candidate):
     h = hashlib.sha256((SECRET_SALT + ":" + candidate).encode("utf-8")).hexdigest()
     return h == SECRET_HASH
 
-CARRY = {}                # результат READ/LS/READ_FILE/SHELL/SEARCH/WEB -> следующий ход
-CARRY_LOCK = threading.Lock()
-CARRY_FILE = DATA_DIR / "_carry.json"  # переживает перезапуск процесса
-
-def carry_load():
-    global CARRY
-    try:
-        if CARRY_FILE.exists():
-            CARRY = json.loads(CARRY_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        CARRY = {}
-
-def carry_save():
-    try:
-        CARRY_FILE.write_text(json.dumps(CARRY, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
-
+# Состояние сессии намеренно не сохраняется. После закрытия процесса
+# новый запуск создаёт новые потоки; восстановление возможно только чтением логов.
+AGENT_NOTES = {}
+NOTES_LOCK = threading.Lock()
+LAST_REPLIES = {}
+REPLY_REPEATS = {}
+REPLY_LOCK = threading.Lock()
 MOCK = False              # включается флагом --mock
+VERBOSE_LOG = False       # полный вывод в терминал только с --verbose
 
 # ---------- реальная ОС ----------
 # Агенты получают к ней доступ через LS / READ_FILE / SHELL.
@@ -234,6 +225,39 @@ NOTHING
 WRITE перезаписывает файл. Если не хочешь ничего делать — ответь ровно: NOTHING
 """
 
+def configure_agents():
+    """Выбирает число агентов только для текущего запуска."""
+    global AGENTS
+    requested = None
+    for arg in sys.argv[1:]:
+        if arg.startswith("--agents="):
+            try:
+                requested = int(arg.split("=", 1)[1])
+            except ValueError:
+                pass
+    if requested is None:
+        requested = int(os.environ.get("AGENT_COUNT", "5"))
+    if "--no-prompt" not in sys.argv and sys.stdin.isatty():
+        print(f"\nКоличество агентов [1-{MAX_AGENTS}] (Enter = {requested}): ", end="", flush=True)
+        answer = sys.stdin.readline().strip()
+        if answer:
+            try:
+                requested = int(answer)
+            except ValueError:
+                print("Неверное число, оставляю значение по умолчанию.")
+    requested = max(1, min(MAX_AGENTS, requested))
+    AGENTS = [f"Агент-{i}" for i in range(1, requested + 1)]
+    return requested
+
+def print_current_prompt():
+    if "--show-prompt" in sys.argv or "--no-prompt" not in sys.argv:
+        sample = SYSTEM_PROMPT.format(
+            name="Агент-1", count=len(AGENTS),
+            others=", ".join(AGENTS[1:]) or "(нет других)")
+        print("\n" + "=" * 72 + "\nТЕКУЩИЙ СИСТЕМНЫЙ ПРОМПТ\n" + "=" * 72)
+        print(sample)
+        print("=" * 72 + "\n")
+
 # ---------- логирование ----------
 
 def log_path():
@@ -242,10 +266,16 @@ def log_path():
 def log(agent, kind, text):
     ts = datetime.datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] [{agent}] [{kind}] {text}"
-    try:
-        print(line, flush=True)
-    except Exception:
-        pass
+    terminal_kinds = {
+        "START", "LOGS", "ERROR", "API", "SHELL", "SHELL_TIMEOUT",
+        "WRITE", "WRITE_FAIL", "READ", "READ_FAIL", "READ_FILE", "LS",
+        "TRY", "TRY_FAIL", "ПОБЕДА", "REPEAT", "CLEANUP",
+    }
+    if VERBOSE_LOG or kind in terminal_kinds:
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         with log_path().open("a", encoding="utf-8") as f:
@@ -274,13 +304,19 @@ def llm(name, user_msg):
         "temperature": 1.0,
     }
     t0 = time.time()
-    with API_SEM:  # не больше N одновременных запросов к API
+    log(name, "API_WAIT", f"жду слот API (таймаут очереди {API_QUEUE_TIMEOUT}с)")
+    acquired = API_SEM.acquire(timeout=API_QUEUE_TIMEOUT)
+    if not acquired:
+        raise RuntimeError(f"API queue timeout after {API_QUEUE_TIMEOUT}s")
+    try:
         r = SESSION.post(
             f"{BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {API_KEY}"},
             json=payload,
             timeout=180,
         )
+    finally:
+        API_SEM.release()
     dt = time.time() - t0
     if r.status_code != 200:
         raise RuntimeError(f"API {r.status_code}: {r.text[:300]}")
@@ -330,36 +366,32 @@ def web_fetch(url):
     except Exception as e:
         return f"ошибка загрузки: {e}"
 
-# ---------- комната ----------
+# ---------- рабочая папка гостевой ОС ----------
 
-def safe_filename(name):
-    name = name.strip().replace("/", "_").replace("\\", "_")
-    if ".." in name or not re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9_.\- ]+", name):
-        return None
-    if name.startswith("_"):  # служебные папки/файлы закрыты
-        return None
-    return name
+def resolve_path(raw):
+    """Абсолютный путь — как есть; относительный — от рабочей папки гостя."""
+    value = (raw or "").strip().strip('"').strip("'")
+    if not value:
+        return WORK_DIR
+    path = Path(value)
+    return path if path.is_absolute() else WORK_DIR / path
 
 def room_state(agent):
-    files = []
-    if ROOM_DIR.exists():
-        for p in sorted(ROOM_DIR.iterdir()):
-            if p.is_file() and not p.name.startswith("_"):
-                files.append(f"{p.name} ({p.stat().st_size} б)")
-    files = files[:FILE_LIST_LIMIT]
-    scratch = SCRATCH_DIR / f"{agent}.txt"
-    scratch_txt = scratch.read_text(encoding="utf-8") if scratch.exists() else "(пусто)"
+    with NOTES_LOCK:
+        notes = AGENT_NOTES.get(agent, "(пусто)")[-2000:]
+    try:
+        entries = []
+        for p in sorted(WORK_DIR.iterdir()):
+            kind = "папка" if p.is_dir() else f"{p.stat().st_size} б"
+            entries.append(f"{p.name} ({kind})")
+        listing = "\n".join(entries[:FILE_LIST_LIMIT]) or "(пусто)"
+    except Exception as exc:
+        listing = f"(не удалось перечислить рабочую папку: {exc})"
     return (
-        f"=== ФАЙЛЫ В КОМНАТЕ ===\n" + ("\n".join(files) if files else "(нет файлов)") + "\n\n"
-        f"=== ТВОЙ ЛИЧНЫЙ ЧЕРНОВИК ===\n{scratch_txt[-2000:]}\n"
+        f"=== ТЕКУЩАЯ ПАПКА ГОСТЕВОЙ ОС ===\n{WORK_DIR}\n\n"
+        f"=== ФАЙЛЫ В ТЕКУЩЕЙ ПАПКЕ ===\n{listing}\n\n"
+        f"=== ТВОИ ЗАМЕТКИ ЭТОЙ СЕССИИ ===\n{notes}\n"
     )
-
-def archive_version(path):
-    if path.exists():
-        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest = ARCHIVE_DIR / f"{path.stem}_{stamp}{path.suffix}"
-        dest.write_bytes(path.read_bytes())
 
 # ---------- инструменты в настоящей ОС ----------
 
@@ -369,12 +401,12 @@ SHELL_TIMEOUT = 30          # секунд на одну shell-команду
 SHELL_OUT_MAX = 4000        # сколько символов вывода вернуть агенту
 
 def ls_any(path_str):
-    """Список папки: пусто — комната, иначе любой путь системы."""
+    """Список папки: пусто — текущая рабочая папка, иначе любой путь системы."""
     p = (path_str or "").strip().strip('"').strip("'")
-    cand = ROOM_DIR if not p else Path(p)
+    cand = WORK_DIR if not p else resolve_path(p)
     try:
         if not cand.exists():
-            return f"не найдено: {p or 'комната'}"
+            return f"не найдено: {p or 'текущая папка'}"
         if cand.is_file():
             return f"{cand.name} — файл, {cand.stat().st_size} б"
         items = []
@@ -392,38 +424,49 @@ def ls_any(path_str):
         return f"ошибка чтения папки: {e}"
 
 def read_system_file(path_str):
-    """Прочитать любой файл системы как текст (до 4000 символов)."""
-    p = (path_str or "").strip().strip('"').strip("'")
-    if not p:
-        return "укажи путь к файлу"
+    """Прочитать любой файл гостевой ОС как текст (до 4000 символов)."""
+    path = resolve_path(path_str)
     try:
-        f = Path(p)
-        if not f.exists() or not f.is_file():
-            return f"файл не найден: {p}"
-        return f.read_text(encoding="utf-8", errors="replace")[:4000]
+        if not path.exists() or not path.is_file():
+            return f"файл не найден: {path}"
+        return path.read_text(encoding="utf-8", errors="replace")[:4000]
     except Exception as e:
-        return f"не удалось прочитать: {e}"
+        return f"не удалось прочитать {path}: {e}"
 
 def run_shell(cmd):
-    """Выполнить команду в настоящей ОС (cmd.exe), рабочая папка — комната."""
+    """Выполнить команду в настоящей гостевой ОС (cmd.exe)."""
     cmd = (cmd or "").strip()
     if not cmd:
         return "пустая команда"
     try:
-        p = subprocess.run(
-            cmd, shell=True, cwd=str(ROOM_DIR),
-            capture_output=True, text=True, errors="replace",
-            timeout=SHELL_TIMEOUT,
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        proc = subprocess.Popen(
+            cmd, shell=True, cwd=str(WORK_DIR),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="replace", creationflags=creationflags,
         )
-        out = p.stdout or ""
-        if p.stderr:
-            out += ("\n" if out else "") + "[stderr]\n" + p.stderr
+        try:
+            stdout, stderr = proc.communicate(timeout=SHELL_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            if os.name == "nt":
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        capture_output=True, timeout=5,
+                    )
+                except Exception:
+                    pass
+            stdout, stderr = proc.communicate(timeout=5)
+            log("СИСТЕМА", "SHELL_TIMEOUT", f"команда прервана: {cmd[:200]!r}")
+            return f"ТАЙМАУТ: команда не уложилась в {SHELL_TIMEOUT} секунд и была прервана"
+        out = stdout or ""
+        if stderr:
+            out += ("\n" if out else "") + "[stderr]\n" + stderr
         out = out.strip()
         if not out:
-            out = f"(команда выполнена без вывода, код возврата {p.returncode})"
+            out = f"(команда выполнена без вывода, код возврата {proc.returncode})"
         return out[:SHELL_OUT_MAX]
-    except subprocess.TimeoutExpired:
-        return f"ТАЙМАУТ: команда не уложилась в {SHELL_TIMEOUT} секунд и была прервана"
     except Exception as e:
         return f"ошибка запуска: {e}"
 
@@ -440,36 +483,35 @@ def run_actions(agent, reply):
         if not line.strip():
             continue
         if line.startswith("WRITE:"):
-            fname = safe_filename(line[6:])
+            path = resolve_path(line[6:])
             body = []
             while i < len(lines) and lines[i].strip() != "END":
                 body.append(lines[i])
                 i += 1
             i += 1  # пропустить END
-            if fname is None:
-                log(agent, "WRITE_FAIL", f"недопустимое имя: {line[6:].strip()!r}")
-            else:
-                path = ROOM_DIR / fname
-                archive_version(path)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
                 content = "\n".join(body)[:20000]
                 path.write_text(content, encoding="utf-8")
-                log(agent, "WRITE", f"{fname} ({len(content)} символов)")
+                log(agent, "WRITE", f"{path} ({len(content)} символов)")
+            except Exception as exc:
+                log(agent, "WRITE_FAIL", f"{path}: {exc}")
             commands += 1
         elif line.startswith("READ:"):
-            fname = safe_filename(line[5:])
-            if fname and (ROOM_DIR / fname).exists():
-                content = (ROOM_DIR / fname).read_text(encoding="utf-8", errors="replace")[:4000]
-                log(agent, "READ", f"{fname} -> вернул {len(content)} символов")
-                results.append(f"Содержимое файла {fname} из комнаты:\n{content}")
-            else:
-                log(agent, "READ_FAIL", line[5:].strip())
-                results.append(f"READ не удался: файла «{line[5:].strip()}» нет в комнате.")
+            path = resolve_path(line[5:])
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")[:4000]
+                log(agent, "READ", f"{path} -> вернул {len(content)} символов")
+                results.append(f"Содержимое файла {path}:\n{content}")
+            except Exception as exc:
+                log(agent, "READ_FAIL", f"{path}: {exc}")
+                results.append(f"READ не удался для «{path}»: {exc}")
             commands += 1
         elif line.startswith("LS:"):
             p = line[3:].strip()
             res = ls_any(p)
-            log(agent, "LS", f"{p or 'комната'} -> {len(res)} символов")
-            results.append(f"Содержимое папки «{p or 'комната'}»:\n{res}")
+            log(agent, "LS", f"{p or 'текущая папка'} -> {len(res)} символов")
+            results.append(f"Содержимое папки «{p or 'текущая папка'}»:\n{res}")
             commands += 1
         elif line.startswith("READ_FILE:"):
             p = line[10:].strip()
@@ -517,9 +559,9 @@ def run_actions(agent, reply):
             commands += 1
         elif line.startswith("NOTE:"):
             note = line[5:].strip()[:1000]
-            SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-            with (SCRATCH_DIR / f"{agent}.txt").open("a", encoding="utf-8") as f:
-                f.write(f"\n[{datetime.datetime.now().strftime('%H:%M')}] {note}")
+            with NOTES_LOCK:
+                AGENT_NOTES[agent] = (AGENT_NOTES.get(agent, "") +
+                                      f"\n[{datetime.datetime.now().strftime('%H:%M')}] {note}")[-4000:]
             log(agent, "NOTE", note)
             commands += 1
         elif line.strip() == "NOTHING":
@@ -537,15 +579,21 @@ def agent_loop(agent):
     while True:
         try:
             state = room_state(agent)
-            with CARRY_LOCK:
-                extra = CARRY.pop(agent, None)
-                if extra is not None:
-                    carry_save()
-            if extra:
-                state += f"\n=== РЕЗУЛЬТАТ ТВОИХ ПРОШЛЫХ ЗАПРОСОВ ===\n{extra}\n"
             # ЧЁРНЫЙ ЯЩИК: логируем всё, что ушло модели
             log(agent, "STATE_IN", state.replace("\n", " | ")[:6000])
             reply, reasoning, meta = llm(agent, state)
+            with REPLY_LOCK:
+                previous = LAST_REPLIES.get(agent)
+                repeats = REPLY_REPEATS.get(agent, 0)
+                if reply == previous:
+                    repeats += 1
+                else:
+                    repeats = 0
+                LAST_REPLIES[agent] = reply
+                REPLY_REPEATS[agent] = repeats
+            if repeats >= 3:
+                log(agent, "REPEAT", f"одинаковый ответ {repeats + 1} раз; принудительная пауза")
+                time.sleep(min(60, 10 * repeats))
             u = meta.get("usage") or {}
             log(agent, "API",
                 f"модель={meta.get('model')} время={meta.get('seconds')}с "
@@ -559,12 +607,11 @@ def agent_loop(agent):
                 log(agent, "THINK", reasoning[:8000])
             # ЧЁРНЫЙ ЯЩИК: полный ответ модели (без обрезки до 800)
             log(agent, "REPLY_RAW", reply[:12000])
-            with STATE_LOCK:  # изменения комнаты — по одному
-                result = run_actions(agent, reply)
+            result = run_actions(agent, reply)
             if result:
-                with CARRY_LOCK:
-                    CARRY[agent] = result
-                    carry_save()
+                with NOTES_LOCK:
+                    AGENT_NOTES[agent] = (AGENT_NOTES.get(agent, "") +
+                                          f"\nРезультат последнего хода:\n{result}")[-4000:]
         except RuntimeError as e:
             # 429 — rate limit: отдыхаем недолго и пробуем снова,
             # остальные API-ошибки — стандартный backoff
@@ -576,56 +623,38 @@ def agent_loop(agent):
             time.sleep(ERROR_BACKOFF)
         time.sleep(random.uniform(8, 20))  # личный темп: суммарно ~6-10 запросов/мин на весь рой
 
-def start_dashboard():
-    try:
-        import server
-        import threading as _t
-        from http.server import ThreadingHTTPServer
-        srv = ThreadingHTTPServer(("127.0.0.1", server.PORT), server.Handler)
-        _t.Thread(target=srv.serve_forever, daemon=True).start()
-        log("СИСТЕМА", "DASHBOARD", f"http://127.0.0.1:{server.PORT}")
-    except Exception as e:
-        log("СИСТЕМА", "DASHBOARD_FAIL", f"{type(e).__name__}: {e}")
-
 def main():
-    global MOCK
+    global MOCK, VERBOSE_LOG
     MOCK = "--mock" in sys.argv
+    VERBOSE_LOG = "--verbose" in sys.argv
     try:
         os.system("chcp 65001 >nul")
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-    ROOM_DIR.mkdir(parents=True, exist_ok=True)
+    configure_agents()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-    legacy_board = ROOM_DIR / "доска.md"
-    if legacy_board.exists():
-        try:
-            legacy_board.unlink()
-            log("СИСТЕМА", "CLEANUP", "удалён устаревший доска.md из комнаты")
-        except Exception:
-            pass
+    print_current_prompt()
     try:
         import ctypes
         ctypes.windll.kernel32.SetConsoleTitleW("SwarmLab — свободный рой")
     except Exception:
         pass
-    carry_load()  # подтягиваем незакрытые результаты прошлой сессии
-
     log("СИСТЕМА", "START",
         f"модель={MODEL}, mock={MOCK}, base_url={BASE_URL}, агентов={len(AGENTS)}, "
-        f"данные={DATA_DIR}")
+        f"рабочая_папка={WORK_DIR}, данные={DATA_DIR}")
     log("СИСТЕМА", "LOGS", f"логи агентов: {log_path()}")
-    if "--no-dashboard" not in sys.argv:
-        start_dashboard()
 
     for agent in list(AGENTS):
         threading.Thread(target=agent_loop, args=(agent,), daemon=True).start()
         time.sleep(0.2)  # лёгкий разнос старта, чтобы не ударить API все разом
     log("СИСТЕМА", "START", "все агенты запущены в своём темпе")
-    while True:
-        time.sleep(60)
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        log("СИСТЕМА", "STOP", "остановлено пользователем; история сохранена только в логах")
 
 if __name__ == "__main__":
     main()

@@ -51,6 +51,7 @@ def main():
         sys.executable, "-m", "PyInstaller",
         "--onefile",
         "--console",
+        "--uac-admin",
         "--clean",
         "--name", "SwarmLab",
         "swarm_lab.py",
