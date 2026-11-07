@@ -29,6 +29,8 @@ HTML = """<!DOCTYPE html>
   .SEARCH,.WEB { color:#d2a8ff; } .ERROR,.READ_FAIL,.WRITE_FAIL { color:#ff7b72; }
   .NOTE { color:#8b949e; } .ROUND,.START,.LOGS { color:#f0e68c; }
   .SHELL { color:#ff2d78; font-weight:bold; }
+  .TRY,.ПОБЕДА { color:#7ee787; font-weight:bold; }
+  .TRY_FAIL { color:#ff7b72; }
   .THINK { color:#56d4dd; font-style:italic; opacity:0.85; }
   #dot { color:#3fb950; } .off { color:#ff7b72 !important; }
 </style>
@@ -45,7 +47,7 @@ HTML = """<!DOCTYPE html>
 const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;');
 function kindClass(line){ const m = line.match(/\\[([A-Z_]+)\\]/g); if(!m) return '';
   const k = m.map(x=>x.slice(1,-1));
-  for (const c of ['ERROR','SHELL','READ_FILE','LS','WRITE','READ','SEARCH','WEB','NOTE','START','LOGS'])
+  for (const c of ['ERROR','ПОБЕДА','TRY_FAIL','TRY','SHELL','READ_FILE','LS','WRITE','READ','SEARCH','WEB','NOTE','START','LOGS','CLEANUP'])
     if (k.includes(c)) return c; return ''; }
 function extractThoughts(logLines){
   const events = [];

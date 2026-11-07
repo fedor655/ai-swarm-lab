@@ -27,7 +27,7 @@ def read_env():
 
 def write_embedded(vals):
     keys = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "MODEL",
-            "AGENT_COUNT", "MAX_TOTAL_AGENTS"]
+            "AGENT_COUNT", "SWARM_SECRET_SALT", "SWARM_SECRET_HASH"]
     lines = [
         "# -*- coding: utf-8 -*-",
         '"""Автогенерация build_exe.py: настройки, зашитые в exe. Не коммитить!"""',
