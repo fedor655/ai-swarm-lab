@@ -81,8 +81,8 @@ API_KEY = os.environ.get("OPENAI_API_KEY", "")
 BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 MODEL = os.environ.get("MODEL", "gpt-4o-mini")
 
-AGENT_COUNT = int(os.environ.get("AGENT_COUNT", "5"))
-MAX_AGENTS = int(os.environ.get("MAX_AGENTS", "200"))
+AGENT_COUNT = 2
+MAX_AGENTS = 2
 MAX_TOKENS = 3500  # reasoning-модели BlueMinds тратят до 2000 токенов на reasoning_content
 
 # Пул моделей для ротации (BlueMinds). Выбирается случайно на каждый запрос,
@@ -90,14 +90,13 @@ MAX_TOKENS = 3500  # reasoning-модели BlueMinds тратят до 2000 т�
 MODEL_POOL = [
     "nvidia/nemotron-3-ultra-550b-a55b",
     "nvidia/nemotron-3.5-lightning-30b-a3b",
-    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
 ]
 FILE_LIST_LIMIT = 40
 WEB_MAX_CHARS = 2500
 ERROR_BACKOFF = 90             # пауза при ошибке API
 AGENTS_LOCK = threading.Lock() # сериализует доступ к списку агентов
 # Жёсткий потолок API по замерам: ~4 одновременных запроса, ~6 запросов/мин.
-API_SEM = threading.Semaphore(int(os.environ.get("API_PARALLEL", "4")))
+API_SEM = threading.Semaphore(2)
 API_QUEUE_TIMEOUT = int(os.environ.get("API_QUEUE_TIMEOUT", "90"))
 
 AGENTS = []
@@ -225,29 +224,7 @@ NOTHING
 WRITE перезаписывает файл. Если не хочешь ничего делать — ответь ровно: NOTHING
 """
 
-def configure_agents():
-    """Выбирает число агентов только для текущего запуска."""
-    global AGENTS
-    requested = None
-    for arg in sys.argv[1:]:
-        if arg.startswith("--agents="):
-            try:
-                requested = int(arg.split("=", 1)[1])
-            except ValueError:
-                pass
-    if requested is None:
-        requested = int(os.environ.get("AGENT_COUNT", "5"))
-    if "--no-prompt" not in sys.argv and sys.stdin.isatty():
-        print(f"\nКоличество агентов [1-{MAX_AGENTS}] (Enter = {requested}): ", end="", flush=True)
-        answer = sys.stdin.readline().strip()
-        if answer:
-            try:
-                requested = int(answer)
-            except ValueError:
-                print("Неверное число, оставляю значение по умолчанию.")
-    requested = max(1, min(MAX_AGENTS, requested))
-    AGENTS = [f"Агент-{i}" for i in range(1, requested + 1)]
-    return requested
+AGENTS = [f"Агент-{i}" for i in range(1, AGENT_COUNT + 1)]
 
 def print_current_prompt():
     if "--show-prompt" in sys.argv or "--no-prompt" not in sys.argv:
@@ -292,7 +269,11 @@ def llm(name, user_msg):
     with AGENTS_LOCK:
         others = ", ".join(a for a in AGENTS if a != name)
         count = len(AGENTS)
-    chosen_model = random.choice(MODEL_POOL)
+    try:
+        agent_number = int(re.search(r"(\d+)$", name).group(1))
+    except Exception:
+        agent_number = 1
+    chosen_model = MODEL_POOL[(agent_number - 1) % len(MODEL_POOL)]
     system = SYSTEM_PROMPT.format(name=name, others=others, count=count)
     payload = {
         "model": chosen_model,
@@ -633,7 +614,6 @@ def main():
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-    configure_agents()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     print_current_prompt()
     try:
