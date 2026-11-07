@@ -211,14 +211,14 @@ def log(agent, kind, text):
 # ---------- API ----------
 
 def llm(name, user_msg):
+    """Возвращает (ответ, размышления, метаданные запроса)."""
     if MOCK:
-        return f"SAY: Привет, я {name}. Осматриваюсь.\nNOTE: первый ход"
+        return (f"SAY: Привет, я {name}. Осматриваюсь.\nNOTE: первый ход", "", {})
     with AGENTS_LOCK:
         others = ", ".join(a for a in AGENTS if a != name)
         count = len(AGENTS)
     chosen_model = random.choice(MODEL_POOL)
-    system = SYSTEM_PROMPT.format(name=name, others=others, count=count,
-                                  api_key=API_KEY, base_url=BASE_URL, model=chosen_model)
+    system = SYSTEM_PROMPT.format(name=name, others=others, count=count)
     payload = {
         "model": chosen_model,
         "messages": [
@@ -228,22 +228,31 @@ def llm(name, user_msg):
         "max_tokens": MAX_TOKENS,
         "temperature": 1.0,
     }
+    t0 = time.time()
     r = SESSION.post(
         f"{BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {API_KEY}"},
         json=payload,
-        timeout=90,
+        timeout=180,
     )
+    dt = time.time() - t0
     if r.status_code != 200:
         raise RuntimeError(f"API {r.status_code}: {r.text[:300]}")
-    msg = r.json()["choices"][0]["message"]
+    data = r.json()
+    msg = data["choices"][0]["message"]
     content = (msg.get("content") or "").strip()
-    if not content:
+    reasoning = (msg.get("reasoning_content") or "").strip()
+    if not content and reasoning:
         # reasoning-модель: ответ может быть в reasoning_content
-        content = (msg.get("reasoning_content") or "").strip()
-    if not content:
-        return "NOTHING"
-    return content
+        content = reasoning
+        reasoning = ""
+    meta = {
+        "model": chosen_model,
+        "seconds": round(dt, 1),
+        "usage": data.get("usage", {}),
+        "finish": data["choices"][0].get("finish_reason"),
+    }
+    return (content or "NOTHING", reasoning, meta)
 
 # ---------- интернет ----------
 
@@ -492,8 +501,22 @@ def agent_loop(agent):
                 extra = CARRY.pop(agent, None)
             if extra:
                 state += f"\n=== РЕЗУЛЬТАТ ТВОИХ ПРОШЛЫХ ЗАПРОСОВ ===\n{extra}\n"
-            reply = llm(agent, state)
-            log(agent, "REPLY_RAW", reply[:800].replace("\n", " | "))
+            # ЧЁРНЫЙ ЯЩИК: логируем всё, что ушло модели
+            log(agent, "STATE_IN", state.replace("\n", " | ")[:6000])
+            reply, reasoning, meta = llm(agent, state)
+            u = meta.get("usage") or {}
+            log(agent, "API",
+                f"модель={meta.get('model')} время={meta.get('seconds')}с "
+                f"finish={meta.get('finish')} "
+                f"токены: prompt={u.get('prompt_tokens')} "
+                f"completion={u.get('completion_tokens')} "
+                f"(reasoning={ (u.get('completion_tokens_details') or {}).get('reasoning_tokens') }) "
+                f"total={u.get('total_tokens')}")
+            if reasoning:
+                # ЧЁРНЫЙ ЯЩИК: полные размышления модели
+                log(agent, "THINK", reasoning[:8000])
+            # ЧЁРНЫЙ ЯЩИК: полный ответ модели (без обрезки до 800)
+            log(agent, "REPLY_RAW", reply[:12000])
             with STATE_LOCK:  # изменения комнаты — по одному
                 result = run_actions(agent, reply)
             if result:
