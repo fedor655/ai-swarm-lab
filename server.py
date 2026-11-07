@@ -49,22 +49,18 @@ function kindClass(line){ const m = line.match(/\\[([A-Z_]+)\\]/g); if(!m) retur
   for (const c of ['ERROR','ПОБЕДА','ESCAPE','HOST_LS','HOST_READ','SAY','WRITE','READ','SEARCH','WEB','NOTE','ROUND','START'])
     if (k.includes(c)) return c; return ''; }
 function extractThoughts(logLines){
-  // Ищем строки REPLY_RAW — это сырой ответ модели, включающий reasoning_content
-  const thoughts = [];
+  // Чёрный ящик: собираем ВСЕ подробности — STATE_IN, API, THINK, REPLY_RAW
+  const events = [];
   for (const l of logLines) {
-    if (!l.includes('[REPLY_RAW]')) continue;
-    // Формат: [HH:MM:SS] [Агент-N] [REPLY_RAW] текст | продолжение
-    const m = l.match(/\\]\\s*\\[([^\\]]+)\\]\\s*\\[REPLY_RAW\\]\\s*(.*)/);
-    if (m) {
-      const agent = m[1];
-      const raw = m[2].replace(/ \\| /g, '\\n');
-      // Если в сыром ответе есть длинный текст (>100 символов), это скорее всего reasoning
-      if (raw.length > 100) {
-        thoughts.push({agent, text: raw});
-      }
+    // Формат: [HH:MM:SS] [Агент-N] [KIND] текст
+    const m = l.match(/\\[([^\\]]+)\\]\\s*\\[([^\\]]+)\\]\\s*\\[([A-Z_]+)\\]\\s*(.*)/);
+    if (!m) continue;
+    const ts = m[1], agent = m[2], kind = m[3], text = m[4];
+    if (kind === 'STATE_IN' || kind === 'API' || kind === 'THINK' || kind === 'REPLY_RAW' || kind === 'ERROR') {
+      events.push({ts, agent, kind, text: text.replace(/ \\| /g, '\\n')});
     }
   }
-  return thoughts.slice(-50);  // последние 50 мыслей
+  return events.slice(-80);  // последние 80 событий
 }
 async function tick(){
   try {
@@ -72,11 +68,15 @@ async function tick(){
     document.getElementById('logbody').innerHTML =
       d.log.map(l=>`<span class="${kindClass(l)}">${esc(l)}</span>`).join('\\n');
     document.getElementById('boardbody').textContent = d.board;
-    // Чёрный ящик мыслей
-    const thoughts = extractThoughts(d.log);
-    document.getElementById('thinkbody').innerHTML = thoughts.length
-      ? thoughts.map(t=>`<b style="color:#56d4dd">🧠 ${esc(t.agent)}</b>\\n<span class="THINK">${esc(t.text)}</span>`).join('\\n\\n')
-      : '(агенты пока молчат или думают тихо)';
+    // Чёрный ящик мыслей — максимальная детализация
+    const events = extractThoughts(d.log);
+    document.getElementById('thinkbody').innerHTML = events.length
+      ? events.map(e=>{
+          const color = e.kind==='THINK' ? '#56d4dd' : e.kind==='API' ? '#f0e68c' : e.kind==='ERROR' ? '#ff7b72' : '#c9d1d9';
+          const prefix = e.kind==='STATE_IN' ? '📥 ВХОД' : e.kind==='API' ? '📡 API' : e.kind==='THINK' ? '🧠 МЫСЛЬ' : e.kind==='REPLY_RAW' ? '💬 ОТВЕТ' : '❌ ОШИБКА';
+          return `<b style="color:${color}">${prefix} ${esc(e.agent)} [${esc(e.ts)}]</b>\\n<span class="THINK">${esc(e.text.slice(0,2000))}</span>`;
+        }).join('\\n\\n')
+      : '(агенты пока молчат)';
     document.getElementById('filesbody').innerHTML = d.files.length
       ? d.files.map(f=>`<b style="color:#ffa657">📄 ${esc(f.name)}</b>\\n${esc(f.content)}`).join('\\n\\n')
       : '(пока пусто)';
