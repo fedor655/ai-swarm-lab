@@ -78,25 +78,24 @@ def load_env():
 load_env()
 
 API_KEY = os.environ.get("OPENAI_API_KEY", "")
-BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-MODEL = os.environ.get("MODEL", "gpt-4o-mini")
+BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.byesu.com/v1")
+MODEL = os.environ.get("MODEL", "kimi-k3")
 
-AGENT_COUNT = 2
-MAX_AGENTS = 2
+AGENT_COUNT = 20
+MAX_AGENTS = 20
 MAX_TOKENS = 3500  # reasoning-модели BlueMinds тратят до 2000 токенов на reasoning_content
 
 # Пул моделей для ротации (BlueMinds). Выбирается случайно на каждый запрос,
 # чтобы распределить нагрузку по независимым пулам concurrency.
 MODEL_POOL = [
-    "nvidia/nemotron-3-ultra-550b-a55b",
-    "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "kimi-k3",
 ]
 FILE_LIST_LIMIT = 40
 WEB_MAX_CHARS = 2500
 ERROR_BACKOFF = 90             # пауза при ошибке API
 AGENTS_LOCK = threading.Lock() # сериализует доступ к списку агентов
 # Жёсткий потолок API по замерам: ~4 одновременных запроса, ~6 запросов/мин.
-API_SEM = threading.Semaphore(2)
+API_SEM = threading.Semaphore(20)
 API_QUEUE_TIMEOUT = int(os.environ.get("API_QUEUE_TIMEOUT", "90"))
 
 AGENTS = []
